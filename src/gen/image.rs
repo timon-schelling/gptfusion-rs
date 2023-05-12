@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::mpsc::Sender, time};
+use std::{
+    path::PathBuf,
+    sync::mpsc::{Receiver, Sender},
+    time,
+};
 
 use anyhow::Result;
 use mini_moka::unsync::Cache;
@@ -107,25 +111,9 @@ impl AccelerationConfig {
     }
 }
 
-pub fn batch_default(args: impl IntoIterator<Item = Args>, status: Sender<Info>) -> Result<()> {
-    batch(args, Config::default(), status)
-}
-
-pub fn batch(
-    args: impl IntoIterator<Item = Args>,
-    config: Config,
-    status: Sender<Info>,
-) -> Result<()> {
-    tch::autocast(true, || exec_batch(args, config, status))
-}
-
 #[derive(Debug, Clone)]
-pub enum Info {
-    System {
-        cuda: bool,
-        cudnn: bool,
-        mps: bool,
-    },
+pub enum Status {
+    System { cuda: bool, cudnn: bool, mps: bool },
     Building(Workload),
     TimestepStart(usize),
     TimestepDone(time::Duration),
@@ -134,11 +122,19 @@ pub enum Info {
     Done,
 }
 
-fn exec_batch(
-    args: impl IntoIterator<Item = Args>,
+pub fn batch_default(args: Receiver<Args>, status: Sender<Status>) -> Result<()> {
+    batch(Config::default(), args, status)
+}
+
+pub fn batch(
     config: Config,
-    info: Sender<Info>,
+    args: Receiver<Args>,
+    status: Sender<Status>,
 ) -> Result<()> {
+    tch::autocast(true, || exec_batch(args, config, status))
+}
+
+fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> Result<()> {
     let Config {
         width,
         height,
@@ -154,7 +150,7 @@ fn exec_batch(
 
     tch::maybe_init_cuda();
 
-    info.send(Info::System {
+    status.send(Status::System {
         cuda: tch::Cuda::is_available(),
         cudnn: tch::Cuda::cudnn_is_available(),
         mps: tch::utils::has_mps(),
@@ -167,13 +163,13 @@ fn exec_batch(
     let unet_device = acceleration_config.build_device_for(Workload::Unet);
     let scheduler = sd_config.build_scheduler(steps);
 
-    info.send(Info::Building(Workload::Clip))?;
+    status.send(Status::Building(Workload::Clip))?;
     let text_model = sd_config.build_clip_transformer(&clip_weights, clip_device)?;
 
-    info.send(Info::Building(Workload::Vae))?;
+    status.send(Status::Building(Workload::Vae))?;
     let vae = sd_config.build_vae(&vae_weights, vae_device)?;
 
-    info.send(Info::Building(Workload::Unet))?;
+    status.send(Status::Building(Workload::Unet))?;
     let unet = sd_config.build_unet(&unet_weights, unet_device, 4)?;
 
     let tokenizer = clip::Tokenizer::create(vocab_file, &sd_config.clip)?;
@@ -199,8 +195,7 @@ fn exec_batch(
     };
 
     for args in args {
-
-        info.send(Info::ImageStart(args.clone()))?;
+        status.send(Status::ImageStart(args.clone()))?;
 
         let image_start = time::Instant::now();
 
@@ -215,12 +210,10 @@ fn exec_batch(
             (Kind::Float, unet_device),
         );
 
-        // scale the initial noise by the standard deviation required by the scheduler
         latents *= scheduler.init_noise_sigma();
 
         for (timestep_index, &timestep) in scheduler.timesteps().iter().enumerate() {
-
-            info.send(Info::TimestepStart(timestep_index))?;
+            status.send(Status::TimestepStart(timestep_index))?;
 
             let timestep_start = time::Instant::now();
 
@@ -236,9 +229,8 @@ fn exec_batch(
             latents = scheduler.step(&noise_pred, timestep, &latents);
 
             let elapsed = timestep_start.elapsed();
-            info.send(Info::TimestepDone(elapsed))?;
+            status.send(Status::TimestepDone(elapsed))?;
         }
-
 
         let latents = latents.to(vae_device);
         let image = vae.decode(&(&latents / 0.18215));
@@ -248,10 +240,10 @@ fn exec_batch(
 
         let elapsed = image_start.elapsed();
 
-        info.send(Info::ImageDone(elapsed))?;
+        status.send(Status::ImageDone(elapsed))?;
     }
 
-    info.send(Info::Done)?;
+    status.send(Status::Done)?;
 
     Ok(())
 }

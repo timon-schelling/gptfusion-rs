@@ -1,185 +1,187 @@
+const SAMPLES: usize = 100;
+const PROMTS: &'static [&'static str] = &[
+    // "photo of cat",
+    "photo of cat, unreal engine",
+    // "photo of the early morning hours",
+    "photo of mountains",
+    // "surreal landscape",
+    // "image of an alien planet with unique flora and fauna",
+    // "photo of a city at night",
+    "photo of a city at night, cyberpunk",
+    "Cute small cat sitting in a movie theater eating chicken wiggs watching a movie, unreal engine, cozy indoor lighting, artstation, detailed, digital painting, cinematic,character design by mark ryden and pixar and hayao miyazaki, unreal 5, daz, hyperrealistic, octane render"
+    // "Luke Skywalker ordering a burger and fries from the Death Star canteen",
+];
+
 use std::{
-    fmt::Display,
-    process::exit,
-    sync::mpsc::{self, Receiver, Sender},
+    fs,
+    io::{stdout, Write},
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
     thread,
+    time::Duration,
 };
+
+use anyhow::Result;
+
+use sliding_window_alt::SlidingWindow;
 
 use gen::image::*;
 use rand::Rng;
-use tui::{
-    style::*,
-    text::{Span, Spans},
-    widgets::*,
-};
 
 mod gen;
 
 fn main() {
     let start_time = chrono::offset::Utc::now();
 
-    let promts = vec![
-        // "photo of the early universe",
-        "photo of the early morning hours",
-        // "photo of the earth from space",
-        "photo of mountains",
-        "surreal landscape",
-        // "futuristic technology",
-        // "image of a mythical creature that has never been seen before",
-        "image of an alien planet with unique flora and fauna",
-        // "cityscape that merges different architectural styles",
-        // "futuristic vehicle",
-    ];
+    let (status_tx, status_rx) = mpsc::channel::<Status>();
+    let (args_tx, args_rx) = mpsc::channel::<Args>();
 
-    let (tx, rx): (Sender<Info>, Receiver<Info>) = mpsc::channel();
+    let print_info = spawn_print_info_thread(status_rx);
 
-    thread::spawn(move || -> Result<(), anyhow::Error> {
-        use crossterm::{
-            event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-            execute,
-            terminal::{
-                disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-            },
-        };
-        use std::{io, thread, time::Duration};
-        use tui::{
-            backend::CrosstermBackend,
-            layout::{Constraint, Direction, Layout},
-            widgets::{Block, Borders, Widget},
-            Terminal,
-        };
+    let args_gen = thread::spawn(move || -> Result<()> {
+        let mut rng = rand::thread_rng();
 
-        // enable_raw_mode()?;
-        // let mut stdout = io::stdout();
-        // execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        // let backend = CrosstermBackend::new(stdout);
-        // let mut terminal = Terminal::new(backend)?;
+        for _ in 0..SAMPLES {
+            let seed = rng.gen::<i64>();
 
-        let mut cuda = false;
-        let mut cudnn = false;
-        let mut mps = false;
+            for (i, prompt) in PROMTS.iter().enumerate() {
+                let shortend_prompt = prompt.to_string().chars().take(64).collect::<String>();
 
-        let mut workload: Option<Workload> = None;
+                let folder = PathBuf::from(format!(
+                    "out/[{:?}]/{}-({})",
+                    start_time,
+                    i + 1,
+                    shortend_prompt
+                ));
+                fs::create_dir_all(&folder)?;
 
-        let mut step: usize = 0;
+                let path = folder.join(format!("({:x}).png", seed));
 
-        let mut image_duration = Duration::from_secs(0);
-        let mut timestep_duration = Duration::from_secs(0);
-
-        let mut image_arg: Option<Args> = None;
-
-        println!("");
-
-        loop {
-            match rx.recv() {
-                Ok(info) => {
-                    match info.clone() {
-                        Info::System {
-                            cuda: cuda_info,
-                            cudnn: cudnn_info,
-                            mps: mps_info,
-                        } => {
-                            cuda = cuda_info;
-                            cudnn = cudnn_info;
-                            mps = mps_info;
-                        }
-                        Info::Building(w) => {
-                            workload = Some(w);
-                        }
-                        Info::TimestepStart(n) => {
-                            step = n;
-                        }
-                        Info::TimestepDone(d) => {
-                            timestep_duration = d;
-                            print!(
-                                "\rImage: {: >4}ms Timestep: {: >3}ms {: >2}",
-                                image_duration.as_millis(),
-                                timestep_duration.as_millis(),
-                                step,
-                            );
-                        }
-                        Info::ImageStart(a) => {
-                            image_arg = Some(a);
-                        }
-                        Info::ImageDone(d) => {
-                            image_duration = d;
-                        }
-                        Info::Done => break,
-                    }
-
-                    // terminal.draw(|f| {
-                    //     let size = f.size();
-                    //     let seed = match image_arg {
-                    //         Some(ref a) => a.seed.to_string(),
-                    //         None => "".to_string(),
-                    //     };
-                    //     f.render_widget(
-                    //         Table::new(vec![
-                    //             Row::new(vec![
-                    //                 format!("{}", state),
-                    //                 format!("{}", step.to_string()),
-                    //                 format!("{}", timestep_duration.as_millis()),
-                    //             ]),
-                    //             Row::new(vec![
-                    //                 format!("{}", seed),
-                    //                 format!("{}", ""),
-                    //                 format!("{}", image_duration.as_millis()),
-                    //             ]),
-                    //         ])
-                    //         .block(Block::default().title("Table").borders(Borders::ALL)),
-                    //             size,
-                    //         );
-                    // })?;
-
-                    if let Info::Done = info {
-                        break;
-                    }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                Err(_) => break,
+
+                args_tx.send(Args {
+                    prompt: prompt.to_string(),
+                    seed,
+                    path,
+                })?;
             }
         }
-
-        // disable_raw_mode()?;
-        // execute!(
-        //     terminal.backend_mut(),
-        //     LeaveAlternateScreen,
-        //     DisableMouseCapture
-        // )?;
-        // terminal.show_cursor()?;
 
         Ok(())
     });
 
-    let mut rng = rand::thread_rng();
+    let image_gen = thread::spawn(move || -> Result<()> {
+        batch_default(args_rx, status_tx)?;
+        Ok(())
+    });
 
-    let _ = gen::image::batch_default(
-        (0..2)
-            .map(|_| {
-                let seed = rng.gen::<i64>();
+    image_gen.join().unwrap().unwrap();
+    args_gen.join().unwrap().unwrap();
+    print_info.join().unwrap();
+}
 
-                promts.iter().map(move |prompt| {
-                    let folder =
-                        std::path::PathBuf::from(format!("out/[{:?}]/({})", start_time, prompt));
-                    std::fs::create_dir_all(&folder).unwrap();
+fn spawn_print_info_thread(info_rx: Receiver<Status>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        print_info(info_rx);
+    })
+}
 
-                    let path = folder.join(format!("({:x}).png", seed));
+fn print_info(info_rx: Receiver<Status>) {
+    let mut cuda = false;
+    let mut cudnn = false;
+    let mut mps = false;
 
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
+    let mut workload: Option<Workload> = None;
+
+    let mut step: usize = 0;
+
+    const TIMESTEPS_PER_IMAGE: usize = 30;
+    const IMAGE_DURATIONS_TO_KEEP: usize = 10;
+    const TIMESTEP_DURATIONS_TO_KEEP: usize = IMAGE_DURATIONS_TO_KEEP * TIMESTEPS_PER_IMAGE;
+
+    let mut image_durations: SlidingWindow<Option<Duration>> =
+        SlidingWindow::new(IMAGE_DURATIONS_TO_KEEP, None);
+    let mut timestep_durations: SlidingWindow<Option<Duration>> =
+        SlidingWindow::new(TIMESTEP_DURATIONS_TO_KEEP, None);
+
+    let mut image_arg: Option<Args> = None;
+
+    let mut stdout = stdout();
+
+    loop {
+        match info_rx.recv() {
+            Ok(info) => {
+                match info.clone() {
+                    Status::System {
+                        cuda: cuda_info,
+                        cudnn: cudnn_info,
+                        mps: mps_info,
+                    } => {
+                        cuda = cuda_info;
+                        cudnn = cudnn_info;
+                        mps = mps_info;
                     }
-
-                    Args {
-                        prompt: prompt.to_string(),
-                        seed,
-                        path,
+                    Status::Building(w) => {
+                        workload = Some(w);
                     }
-                })
-            })
-            .flatten()
-            .collect::<Vec<_>>(),
-        tx,
-    )
-    .unwrap();
+                    Status::TimestepStart(n) => {
+                        step = n + 1;
+                    }
+                    Status::TimestepDone(d) => {
+                        timestep_durations.push(Some(d));
+                    }
+                    Status::ImageStart(a) => {
+                        image_arg = Some(a);
+                    }
+                    Status::ImageDone(d) => {
+                        image_durations.push(Some(d));
+                        step = 0;
+                    }
+                    Status::Done => break,
+                }
 
-    loop {}
+                if let Status::Done = info {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+
+        print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+
+        let image_durations: Vec<Duration> = image_durations
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .cloned()
+            .collect();
+        let average_image_duration = if image_durations.len() > 0 {
+            image_durations.iter().sum::<Duration>() / image_durations.len() as u32
+        } else {
+            Duration::from_secs(0)
+        };
+
+        let timestep_durations: Vec<Duration> = timestep_durations
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .cloned()
+            .collect();
+        let average_timestep_duration = if timestep_durations.len() > 0 {
+            timestep_durations.iter().sum::<Duration>() / timestep_durations.len() as u32
+        } else {
+            Duration::from_secs(0)
+        };
+
+        print!(
+            "Image time: {: >4}ms Step time: {: >3}ms Step: {: >2}\n",
+            average_image_duration.as_millis(),
+            average_timestep_duration.as_millis(),
+            step,
+        );
+        if let Some(args) = &image_arg {
+            print!("Seed: {:x} Prompt: {: <50}\n", args.seed, args.prompt,);
+        }
+        stdout.flush().unwrap();
+    }
 }
