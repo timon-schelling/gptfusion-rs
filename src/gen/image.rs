@@ -12,10 +12,10 @@ use diffusers::pipelines::stable_diffusion;
 use diffusers::transformers::clip;
 use tch::{nn::Module, Device, Kind, Tensor};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Config {
-    pub width: Option<i64>,
-    pub height: Option<i64>,
+    pub width: i64,
+    pub height: i64,
     pub steps: usize,
     pub acceleration_config: AccelerationConfig,
     pub version: StableDiffusionVersion,
@@ -29,8 +29,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            width: None,
-            height: None,
+            width: 512,
+            height: 512,
             steps: 30,
             acceleration_config: AccelerationConfig::default(),
             version: StableDiffusionVersion::V1_5,
@@ -43,13 +43,13 @@ impl Default for Config {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum StableDiffusionVersion {
     V1_5,
     V2_1,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Args {
     pub prompt: String,
     pub seed: i64,
@@ -72,14 +72,14 @@ fn build_stable_diffusion_config(
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum Workload {
     Clip,
     Vae,
     Unet,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct AccelerationConfig {
     clip: bool,
     vae: bool,
@@ -111,13 +111,23 @@ impl AccelerationConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Metadata {
+    pub prompt: String,
+    pub seed: i64,
+    pub width: i64,
+    pub height: i64,
+    pub steps: usize,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub enum Status {
     System { cuda: bool, cudnn: bool, mps: bool },
     Building(Workload),
     TimestepStart(usize),
     TimestepDone(time::Duration),
-    ImageStart(Args),
+    ImageStart(Metadata),
     ImageDone(time::Duration),
     Done,
 }
@@ -126,11 +136,7 @@ pub fn batch_default(args: Receiver<Args>, status: Sender<Status>) -> Result<()>
     batch(Config::default(), args, status)
 }
 
-pub fn batch(
-    config: Config,
-    args: Receiver<Args>,
-    status: Sender<Status>,
-) -> Result<()> {
+pub fn batch(config: Config, args: Receiver<Args>, status: Sender<Status>) -> Result<()> {
     tch::autocast(true, || exec_batch(args, config, status))
 }
 
@@ -146,7 +152,7 @@ fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> R
         vae_weights,
         unet_weights,
         sliced_attention_size,
-    } = config;
+    } = config.clone();
 
     tch::maybe_init_cuda();
 
@@ -156,7 +162,8 @@ fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> R
         mps: tch::utils::has_mps(),
     })?;
 
-    let sd_config = build_stable_diffusion_config(version, sliced_attention_size, width, height);
+    let sd_config =
+        build_stable_diffusion_config(version, sliced_attention_size, Some(width), Some(height));
 
     let clip_device = acceleration_config.build_device_for(Workload::Clip);
     let vae_device = acceleration_config.build_device_for(Workload::Vae);
@@ -195,7 +202,14 @@ fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> R
     };
 
     for args in args {
-        status.send(Status::ImageStart(args.clone()))?;
+        status.send(Status::ImageStart(Metadata {
+            prompt: args.prompt.clone(),
+            seed: args.seed,
+            width,
+            height,
+            steps,
+            out: args.path.clone(),
+        }))?;
 
         let image_start = time::Instant::now();
 

@@ -1,15 +1,9 @@
 const SAMPLES: usize = 100;
 const PROMTS: &'static [&'static str] = &[
-    // "photo of cat",
     "photo of cat, unreal engine",
-    // "photo of the early morning hours",
     "photo of mountains",
-    // "surreal landscape",
-    // "image of an alien planet with unique flora and fauna",
-    // "photo of a city at night",
     "photo of a city at night, cyberpunk",
     "Cute small cat sitting in a movie theater eating chicken wiggs watching a movie, unreal engine, cozy indoor lighting, artstation, detailed, digital painting, cinematic,character design by mark ryden and pixar and hayao miyazaki, unreal 5, daz, hyperrealistic, octane render"
-    // "Luke Skywalker ordering a burger and fries from the Death Star canteen",
 ];
 
 use std::{
@@ -82,19 +76,13 @@ fn main() {
     print_info.join().unwrap();
 }
 
-fn spawn_print_info_thread(info_rx: Receiver<Status>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        print_info(info_rx);
+fn spawn_print_info_thread(info_rx: Receiver<Status>) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || -> Result<()> {
+        print_info(info_rx)
     })
 }
 
-fn print_info(info_rx: Receiver<Status>) {
-    let mut cuda = false;
-    let mut cudnn = false;
-    let mut mps = false;
-
-    let mut workload: Option<Workload> = None;
-
+fn print_info(info_rx: Receiver<Status>) -> Result<()> {
     let mut step: usize = 0;
 
     const TIMESTEPS_PER_IMAGE: usize = 30;
@@ -106,7 +94,7 @@ fn print_info(info_rx: Receiver<Status>) {
     let mut timestep_durations: SlidingWindow<Option<Duration>> =
         SlidingWindow::new(TIMESTEP_DURATIONS_TO_KEEP, None);
 
-    let mut image_arg: Option<Args> = None;
+    let mut metadata: Option<Metadata> = None;
 
     let mut stdout = stdout();
 
@@ -115,33 +103,42 @@ fn print_info(info_rx: Receiver<Status>) {
             Ok(info) => {
                 match info.clone() {
                     Status::System {
-                        cuda: cuda_info,
-                        cudnn: cudnn_info,
-                        mps: mps_info,
-                    } => {
-                        cuda = cuda_info;
-                        cudnn = cudnn_info;
-                        mps = mps_info;
-                    }
-                    Status::Building(w) => {
-                        workload = Some(w);
-                    }
+                        cuda: _,
+                        cudnn: _,
+                        mps: _,
+                    } => {},
+                    Status::Building(_) => {},
                     Status::TimestepStart(n) => {
                         step = n + 1;
-                    }
+                    },
                     Status::TimestepDone(d) => {
                         timestep_durations.push(Some(d));
-                    }
-                    Status::ImageStart(a) => {
-                        image_arg = Some(a);
-                    }
+                    },
+                    Status::ImageStart(m) => {
+                        metadata = Some(m);
+                    },
                     Status::ImageDone(d) => {
                         image_durations.push(Some(d));
                         step = 0;
-                    }
+
+                        if let Some(mut metadata) = metadata.clone() {
+
+                            let mut path = metadata.out.clone();
+                            path.set_extension("json");
+
+                            let file_name = metadata.out.file_name().unwrap();
+                            let file_name = file_name.to_str().unwrap();
+
+                            metadata.out = file_name.into();
+
+                            let mut contents = serde_json::to_string_pretty(&metadata).unwrap();
+                            contents.push('\n');
+
+                            fs::write(path, contents).unwrap();
+                        }
+                    },
                     Status::Done => break,
                 }
-
                 if let Status::Done = info {
                     break;
                 }
@@ -179,9 +176,11 @@ fn print_info(info_rx: Receiver<Status>) {
             average_timestep_duration.as_millis(),
             step,
         );
-        if let Some(args) = &image_arg {
-            print!("Seed: {:x} Prompt: {: <50}\n", args.seed, args.prompt,);
+        if let Some(metadata) = &metadata {
+            print!("Seed: {:x} Prompt: {: <50}\n", metadata.seed, metadata.prompt);
         }
         stdout.flush().unwrap();
     }
+
+    Ok(())
 }
