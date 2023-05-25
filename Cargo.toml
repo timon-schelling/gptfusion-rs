@@ -8,15 +8,11 @@ anyhow = "1.0"
 
 rand = "0.8"
 
-# torch-sys = "0.11"
-
-tch = "0.11"
+tch = "0.13"
 
 rust-bert = { git = "https://github.com/guillaume-be/rust-bert.git" }
 
-diffusers = { git = "https://github.com/LaurentMazare/diffusers-rs.git" }
-
-mini-moka = "0.10"
+regex = "1.7"
 
 sliding_window_alt = "0.1"
 
