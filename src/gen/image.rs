@@ -1,10 +1,11 @@
 use std::{
+    marker::PhantomData,
     path::PathBuf,
     sync::mpsc::{Receiver, Sender},
     time,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use mini_moka::unsync::Cache;
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,10 @@ pub struct Config {
     pub steps: usize,
     pub acceleration_config: AccelerationConfig,
     pub version: StableDiffusionVersion,
-    pub vocab_file: String,
-    pub clip_weights: String,
-    pub vae_weights: String,
-    pub unet_weights: String,
+    pub vocab_file: PathBuf,
+    pub clip_weights: PathBuf,
+    pub vae_weights: PathBuf,
+    pub unet_weights: PathBuf,
     pub sliced_attention_size: Option<i64>,
 }
 
@@ -34,10 +35,10 @@ impl Default for Config {
             steps: 30,
             acceleration_config: AccelerationConfig::default(),
             version: StableDiffusionVersion::V1_5,
-            vocab_file: "data/weights/image/stable-diffusion/v1-5/vocab.txt".to_string(),
-            clip_weights: "data/weights/image/stable-diffusion/v1-5/clip.ot".to_string(),
-            vae_weights: "data/weights/image/stable-diffusion/v1-5/vae.ot".to_string(),
-            unet_weights: "data/weights/image/stable-diffusion/v1-5/unet.ot".to_string(),
+            vocab_file: "data/weights/image/stable-diffusion/v1-5/vocab.txt".into(),
+            clip_weights: "data/weights/image/stable-diffusion/v1-5/clip.ot".into(),
+            vae_weights: "data/weights/image/stable-diffusion/v1-5/vae.ot".into(),
+            unet_weights: "data/weights/image/stable-diffusion/v1-5/unet.ot".into(),
             sliced_attention_size: None,
         }
     }
@@ -140,6 +141,112 @@ pub fn batch(config: Config, args: Receiver<Args>, status: Sender<Status>) -> Re
     tch::autocast(true, || exec_batch(args, config, status))
 }
 
+trait ClipState {}
+struct ClipStateNew;
+impl ClipState for ClipStateNew {}
+struct ClipStateBuild;
+impl ClipState for ClipStateBuild {}
+
+struct Clip<T>
+where
+    T: ClipState,
+{
+    config: clip::Config,
+    device: Device,
+    vocab: PathBuf,
+    weights: PathBuf,
+    model: Option<clip::ClipTextTransformer>,
+    tokenizer: Option<clip::Tokenizer>,
+    uncond_tokens: Option<Tensor>,
+    _state: PhantomData<T>,
+}
+
+impl<T: ClipState> Clip<T> {
+    fn new(
+        config: clip::Config,
+        device: Device,
+        vocab: PathBuf,
+        weights: PathBuf,
+    ) -> Clip<ClipStateNew> {
+        Clip {
+            config,
+            device,
+            vocab,
+            weights,
+            model: None,
+            tokenizer: None,
+            uncond_tokens: None,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Clip<ClipStateNew> {
+    fn build(self) -> Result<Clip<ClipStateBuild>> {
+        let tokenizer = clip::Tokenizer::create(self.vocab.clone(), &self.config)?;
+
+        let mut vs = tch::nn::VarStore::new(self.device);
+        let model = clip::ClipTextTransformer::new(vs.root(), &self.config);
+        vs.load(self.weights.clone())?;
+
+        Ok(Clip {
+            config: self.config,
+            device: self.device,
+            vocab: self.vocab,
+            weights: self.weights,
+            model: Some(model),
+            tokenizer: Some(tokenizer),
+            uncond_tokens: self.uncond_tokens,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl Clip<ClipStateBuild> {
+    fn embed(&mut self, text: &String) -> Result<Tensor> {
+        fn tokenize(tokenizer: &clip::Tokenizer, device: Device, text: &String) -> Result<Tensor> {
+            let tokens = tokenizer.encode(&text)?;
+            let tokens: Vec<i64> = tokens.into_iter().map(|x| x as i64).collect();
+            Ok(Tensor::of_slice(&tokens).view((1, -1)).to(device))
+        }
+
+        let tokenize =
+            |text: &String| -> Result<Tensor> {
+                let tokenizer: &clip::Tokenizer = &self.tokenizer.as_ref().unwrap();
+                let device = self.device;
+                let tokens = tokenizer.encode(&text)?;
+                let tokens: Vec<i64> = tokens.into_iter().map(|x| x as i64).collect();
+                Ok(Tensor::of_slice(&tokens).view((1, -1)).to(device))
+            };
+
+        let tokenizer = match &self.tokenizer {
+            Some(tokenizer) => tokenizer,
+            None => bail!("model not initialized"),
+        };
+
+        let model = match &self.model {
+            Some(model) => model,
+            None => bail!("model not initialized"),
+        };
+
+        let tokens = tokenize(text)?;
+        let text_embeddings = model.forward(&tokens);
+
+        let uncond_tokens = match &self.uncond_tokens {
+            Some(uncond_tokens) => uncond_tokens.shallow_clone(),
+            None => {
+                let uncond_tokens = tokenize(&"".to_string())?;
+                self.uncond_tokens = Some(uncond_tokens.shallow_clone());
+                uncond_tokens
+            }
+        };
+        let uncond_embeddings = model.forward(&uncond_tokens);
+
+        let embedings = Tensor::cat(&[uncond_embeddings, text_embeddings], 0).to(self.device);
+        Ok(embedings)
+    }
+}
+
 fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> Result<()> {
     let Config {
         width,
@@ -170,36 +277,21 @@ fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> R
     let unet_device = acceleration_config.build_device_for(Workload::Unet);
     let scheduler = sd_config.build_scheduler(steps);
 
+    let mut clip = Clip::<ClipStateNew>::new(
+        sd_config.clip.clone(),
+        clip_device,
+        vocab_file,
+        clip_weights,
+    );
+
     status.send(Status::Building(Workload::Clip))?;
-    let text_model = sd_config.build_clip_transformer(&clip_weights, clip_device)?;
+    let mut clip = clip.build()?;
 
     status.send(Status::Building(Workload::Vae))?;
-    let vae = sd_config.build_vae(&vae_weights, vae_device)?;
+    let vae = sd_config.build_vae(&vae_weights.as_os_str().to_str().unwrap(), vae_device)?;
 
     status.send(Status::Building(Workload::Unet))?;
-    let unet = sd_config.build_unet(&unet_weights, unet_device, 4)?;
-
-    let tokenizer = clip::Tokenizer::create(vocab_file, &sd_config.clip)?;
-
-    let tockenize = |text: &str| -> Result<Tensor> {
-        let tokens = tokenizer.encode(&text)?;
-        let tokens: Vec<i64> = tokens.into_iter().map(|x| x as i64).collect();
-        Ok(Tensor::of_slice(&tokens).view((1, -1)).to(clip_device))
-    };
-
-    let uncond_tokens = tockenize("")?;
-
-    let mut text_embeddings_cache: Cache<String, Tensor> = Cache::new(100);
-
-    let mut text_embeddings = |text: String| -> Result<Tensor> {
-        if let Some(cache_hit) = text_embeddings_cache.get(&text) {
-            return Ok(cache_hit.shallow_clone());
-        };
-        let tokens = tockenize(&text)?;
-        let text_embeddings = text_model.forward(&tokens);
-        let uncond_embeddings = text_model.forward(&uncond_tokens);
-        Ok(Tensor::cat(&[uncond_embeddings, text_embeddings], 0).to(unet_device))
-    };
+    let unet = sd_config.build_unet(&unet_weights.as_os_str().to_str().unwrap(), unet_device, 4)?;
 
     for args in args {
         status.send(Status::ImageStart(Metadata {
@@ -214,7 +306,7 @@ fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> R
         let image_start = time::Instant::now();
 
         let Args { prompt, seed, path } = args;
-        let text_embeddings = text_embeddings(prompt)?;
+        let text_embeddings = clip.embed(&prompt)?;
 
         let _no_grad_guard = tch::no_grad_guard();
 
