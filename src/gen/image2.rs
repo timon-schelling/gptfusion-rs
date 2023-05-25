@@ -103,7 +103,7 @@ impl Default for AccelerationConfig {
     fn default() -> Self {
         Self {
             clip: true,
-            vae: false,
+            vae: true,
             unet: true,
         }
     }
