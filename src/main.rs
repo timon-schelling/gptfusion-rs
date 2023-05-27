@@ -1,5 +1,6 @@
 const SAMPLES: usize = 100;
 const PROMTS: &'static [&'static str] = &[
+    "Wizard with sword and a glowing orb of magic fire fights a fierce dragon Greg Rutkowski",
     "photo of cat, unreal engine",
     "photo of mountains",
     "photo of a city at night, cyberpunk",
@@ -71,29 +72,14 @@ fn main() {
         Ok(())
     });
 
-    match image_gen.join() {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Error: {:?}", e);
-        }
-    };
-    match args_gen.join() {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Error: {:?}", e);
-        }
-    };
-    match print_info.join() {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Error: {:?}", e);
-        }
-    };
+    image_gen.join().unwrap().unwrap();
+    args_gen.join().unwrap().unwrap();
+    print_info.join().unwrap().unwrap();
 }
 
 fn spawn_print_info_thread(info_rx: Receiver<Status>) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || -> Result<()> {
-        print_info(info_rx);
+        print_info(info_rx)?;
         Ok(())
     })
 }
@@ -162,7 +148,7 @@ fn print_info(info_rx: Receiver<Status>) -> Result<()> {
             Err(_) => break,
         }
 
-        // print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+        print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
 
         let image_durations: Vec<Duration> = image_durations
             .iter()
@@ -186,16 +172,16 @@ fn print_info(info_rx: Receiver<Status>) -> Result<()> {
             Duration::from_secs(0)
         };
 
-        // print!(
-        //     "Image time: {: >4}ms Step time: {: >3}ms Step: {: >2}\n",
-        //     average_image_duration.as_millis(),
-        //     average_timestep_duration.as_millis(),
-        //     step,
-        // );
-        // if let Some(metadata) = &metadata {
-        //     print!("Seed: {:x} Prompt: {: <50}\n", metadata.seed, metadata.prompt);
-        // }
-        // stdout.flush().unwrap();
+        print!(
+            "Image time: {: >4}ms Step time: {: >3}ms Step: {: >2}\n",
+            average_image_duration.as_millis(),
+            average_timestep_duration.as_millis(),
+            step,
+        );
+        if let Some(metadata) = &metadata {
+            print!("Seed: {:x} Prompt: {: <50}\n", metadata.seed, metadata.prompt);
+        }
+        stdout.flush().unwrap();
     }
 
     Ok(())
