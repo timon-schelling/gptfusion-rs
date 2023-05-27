@@ -11,7 +11,6 @@
 //! implementation.
 
 pub mod models;
-pub mod pipelines;
 pub mod schedulers;
 pub mod transformers;
 pub mod utils;
