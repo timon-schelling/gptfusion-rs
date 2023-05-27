@@ -6,20 +6,16 @@ use std::{
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-
-use tch::{Device, Tensor};
+use tch::Tensor;
 
 pub(crate) mod backend;
-
-use self::backend::{pipelines::stable_diffusion::StableDiffusionConfig};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Config {
     pub width: i64,
     pub height: i64,
     pub steps: usize,
-    pub acceleration_config: AccelerationConfig,
-    pub version: StableDiffusionVersion,
+    pub version: Version,
     pub vocab_file: PathBuf,
     pub clip_weights: PathBuf,
     pub vae_weights: PathBuf,
@@ -28,23 +24,22 @@ pub struct Config {
 }
 
 impl Config {
-    fn default(version: StableDiffusionVersion) -> Config {
+    fn from_version(version: Version) -> Config {
         let mut base_path = PathBuf::from("data/weights/image/stable-diffusion");
         base_path.push(match version {
-            StableDiffusionVersion::V1_5 => "v1-5",
-            StableDiffusionVersion::V2_1 => "v2-1",
+            Version::V1_5 => "v1-5",
+            Version::V2_1 => "v2-1",
         });
 
         Self {
             width: 512,
             height: 512,
             steps: 30,
-            acceleration_config: AccelerationConfig::default(),
             version,
             vocab_file: base_path.join("vocab.txt"),
-            clip_weights: base_path.join("clip.ot").into(),
-            vae_weights: base_path.join("vae.ot").into(),
-            unet_weights: base_path.join("unet.ot").into(),
+            clip_weights: base_path.join("clip.safetensors").into(),
+            vae_weights: base_path.join("vae.safetensors").into(),
+            unet_weights: base_path.join("unet.safetensors").into(),
             sliced_attention_size: None,
         }
     }
@@ -52,14 +47,104 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::default(StableDiffusionVersion::V1_5)
+        Self::from_version(Version::V2_1)
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum StableDiffusionVersion {
+pub enum Version {
     V1_5,
     V2_1,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackendConfigBuilder {
+    pub clip_config: backend::transformers::clip::Config,
+    pub vae_config: backend::models::vae::AutoEncoderKLConfig,
+    pub unet_config: backend::models::unet_2d::UNet2DConditionModelConfig,
+    pub scheduler_config: backend::schedulers::ddim::DDIMSchedulerConfig,
+}
+
+impl BackendConfigBuilder {
+    pub fn new(version: Version, sliced_attention_size: Option<i64>) -> Self {
+        use backend::models::{unet_2d, vae};
+        use backend::transformers::clip;
+
+        let clip_config = match version {
+            Version::V1_5 => clip::Config::v1_5(),
+            Version::V2_1 => clip::Config::v2_1(),
+        };
+
+        let vae_config = vae::AutoEncoderKLConfig {
+            block_out_channels: vec![128, 256, 512, 512],
+            layers_per_block: 2,
+            latent_channels: 4,
+            norm_num_groups: 32,
+        };
+
+        let unet_config = {
+            let blocks = match version {
+                Version::V1_5 => [
+                    (320, true, 8),
+                    (640, true, 8),
+                    (1280, true, 8),
+                    (1280, false, 8),
+                ],
+                Version::V2_1 => [
+                    (320, true, 5),
+                    (640, true, 10),
+                    (1280, true, 20),
+                    (1280, false, 20),
+                ],
+            }
+            .iter()
+            .map(
+                |(out_channels, use_cross_attn, attention_head_dim)| unet_2d::BlockConfig {
+                    out_channels: *out_channels,
+                    use_cross_attn: *use_cross_attn,
+                    attention_head_dim: *attention_head_dim,
+                },
+            )
+            .collect::<Vec<unet_2d::BlockConfig>>();
+
+            let cross_attention_dim = match version {
+                Version::V1_5 => 768,
+                Version::V2_1 => 1024,
+            };
+
+            let use_linear_projection = match version {
+                Version::V1_5 => false,
+                Version::V2_1 => true,
+            };
+
+            unet_2d::UNet2DConditionModelConfig {
+                blocks: blocks,
+                center_input_sample: false,
+                cross_attention_dim,
+                downsample_padding: 1,
+                flip_sin_to_cos: true,
+                freq_shift: 0.,
+                layers_per_block: 2,
+                mid_block_scale_factor: 1.,
+                norm_eps: 1e-5,
+                norm_num_groups: 32,
+                sliced_attention_size,
+                use_linear_projection,
+            }
+        };
+
+        let scheduler_config = backend::schedulers::ddim::DDIMSchedulerConfig {
+            prediction_type: backend::schedulers::PredictionType::VPrediction,
+            ..Default::default()
+        };
+
+        BackendConfigBuilder {
+            clip_config,
+            vae_config,
+            unet_config,
+            scheduler_config,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -69,59 +154,11 @@ pub struct Args {
     pub path: PathBuf,
 }
 
-fn build_stable_diffusion_config(
-    version: StableDiffusionVersion,
-    sliced_attention_size: Option<i64>,
-    width: Option<i64>,
-    height: Option<i64>,
-) -> StableDiffusionConfig {
-    match version {
-        StableDiffusionVersion::V1_5 => {
-            StableDiffusionConfig::v1_5(sliced_attention_size, height, width)
-        }
-        StableDiffusionVersion::V2_1 => {
-            StableDiffusionConfig::v2_1(sliced_attention_size, height, width)
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum Workload {
     Clip,
     Vae,
     Unet,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct AccelerationConfig {
-    clip: bool,
-    vae: bool,
-    unet: bool,
-}
-
-impl Default for AccelerationConfig {
-    fn default() -> Self {
-        Self {
-            clip: true,
-            vae: false,
-            unet: true,
-        }
-    }
-}
-
-impl AccelerationConfig {
-    fn build_device_for(&self, workload: Workload) -> Device {
-        let is_accelerated = match workload {
-            Workload::Clip => self.clip,
-            Workload::Vae => self.vae,
-            Workload::Unet => self.unet,
-        };
-        if is_accelerated {
-            tch::Device::cuda_if_available()
-        } else {
-            tch::Device::Cpu
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -153,12 +190,169 @@ pub fn batch(config: Config, args: Receiver<Args>, status: Sender<Status>) -> Re
     tch::autocast(true, || exec_batch(args, config, status))
 }
 
+fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> Result<()> {
+    let Config {
+        width,
+        height,
+        steps,
+        version,
+        vocab_file,
+        clip_weights,
+        vae_weights,
+        unet_weights,
+        sliced_attention_size,
+    } = config.clone();
+
+    tch::maybe_init_cuda();
+    let _no_grad_guard = tch::no_grad_guard();
+
+    status.send(Status::System {
+        cuda: tch::Cuda::is_available(),
+        cudnn: tch::Cuda::cudnn_is_available(),
+        mps: tch::utils::has_mps(),
+    })?;
+
+    let clip_device = tch::Device::cuda_if_available();
+    let vae_device = tch::Device::cuda_if_available();
+    let unet_device = tch::Device::cuda_if_available();
+
+    let BackendConfigBuilder {
+        clip_config,
+        vae_config,
+        unet_config,
+        scheduler_config,
+    } = BackendConfigBuilder::new(version, sliced_attention_size);
+
+    let clip =
+        clip::Clip::<clip::ClipStateNew>::new(clip_config, clip_device, vocab_file, clip_weights);
+    let vae = vae::Vae::<vae::VaeStateNew>::new(vae_config, vae_device, vae_weights);
+    let unet = unet::Unet::<unet::UnetStateNew>::new(
+        width,
+        height,
+        steps,
+        unet_config,
+        scheduler_config,
+        unet_device,
+        unet_weights,
+    );
+
+    status.send(Status::Building(Workload::Clip))?;
+    let mut clip = clip.build()?;
+
+    status.send(Status::Building(Workload::Vae))?;
+    let vae = vae.build()?;
+
+    status.send(Status::Building(Workload::Unet))?;
+    let unet = unet.build()?;
+
+    let mut arg: Option<Args> = None;
+    let mut embeddings: Option<Tensor> = None;
+
+    enum UnetWithState {
+        Build(unet::Unet<unet::UnetStateBuild>),
+        Image(unet::Unet<unet::UnetStateImage>),
+        Done(unet::Unet<unet::UnetStateImageDone>),
+    }
+
+    let mut unet = UnetWithState::Build(unet);
+
+    let mut image: Option<Tensor> = None;
+
+    let mut image_start = time::Instant::now();
+
+    let mut timestep = 0;
+
+    loop {
+        let Args { prompt, seed, path } = match arg.clone() {
+            Some(arg) => arg,
+            None => match args.recv() {
+                Ok(a) => {
+                    arg = Some(a);
+                    continue;
+                }
+                Err(_) => break,
+            },
+        };
+
+        let embeds = match embeddings {
+            Some(ref e) => e,
+            None => {
+                let e = clip.embed(&prompt)?;
+                embeddings = Some(e);
+                continue;
+            }
+        };
+
+        unet = match unet {
+            UnetWithState::Build(unet) => {
+                status.send(Status::ImageStart(Metadata {
+                    prompt: prompt.clone(),
+                    seed,
+                    width,
+                    height,
+                    steps,
+                    out: path.clone(),
+                }))?;
+
+                image_start = time::Instant::now();
+
+                UnetWithState::Image(unet.image(embeds, seed))
+            }
+            UnetWithState::Image(mut unet) => {
+
+                let timestep_start = time::Instant::now();
+
+                status.send(Status::TimestepStart(timestep))?;
+
+                let unet = match unet.step() {
+                    Some(()) => UnetWithState::Done(unet.finish()),
+                    None => UnetWithState::Image(unet),
+                };
+
+                status.send(Status::TimestepDone(timestep_start.elapsed()))?;
+
+                timestep += 1;
+
+                if let UnetWithState::Done(_) = unet {
+                    status.send(Status::ImageDone(image_start.elapsed()))?;
+                }
+
+                unet
+            },
+            UnetWithState::Done(unet) => {
+                arg = None;
+                embeddings = None;
+                image = Some(unet.image());
+                let unet = unet.reset()?;
+                UnetWithState::Build(unet)
+            }
+        };
+
+        if let Some(img) = image {
+            let img = vae.decode(img)?;
+
+            tch::vision::image::save(&img, path)?;
+            image = None;
+
+            status.send(Status::ImageDone(image_start.elapsed()))?;
+
+            timestep = 0;
+
+            image_start = time::Instant::now();
+        }
+    }
+
+    status.send(Status::Done)?;
+
+    Ok(())
+}
+
 mod clip {
     use std::{marker::PhantomData, path::PathBuf};
 
     use anyhow::Result;
 
-    use super::backend::transformers::clip;
+    use super::backend::transformers::clip::{self, Tokenizer};
     use tch::{nn::Module, Device, Tensor};
 
     pub(crate) trait ClipState {}
@@ -178,7 +372,7 @@ mod clip {
         weights: PathBuf,
         model: Option<clip::ClipTextTransformer>,
         tokenizer: Option<clip::Tokenizer>,
-        uncond_tokens: Option<Tensor>,
+        uncond_embeddings: Option<Tensor>,
         _state: PhantomData<T>,
     }
 
@@ -196,7 +390,7 @@ mod clip {
                 weights,
                 model: None,
                 tokenizer: None,
-                uncond_tokens: None,
+                uncond_embeddings: None,
                 _state: PhantomData,
             }
         }
@@ -210,6 +404,9 @@ mod clip {
             let model = clip::ClipTextTransformer::new(vs.root(), &self.config);
             vs.load(self.weights.clone())?;
 
+            let uncond_tokens = tokenize(&"".to_string(), &tokenizer)?.to(self.device);
+            let uncond_embeddings = model.forward(&uncond_tokens);
+
             Ok(Clip {
                 config: self.config,
                 device: self.device,
@@ -217,7 +414,7 @@ mod clip {
                 weights: self.weights,
                 model: Some(model),
                 tokenizer: Some(tokenizer),
-                uncond_tokens: self.uncond_tokens,
+                uncond_embeddings: Some(uncond_embeddings),
                 _state: PhantomData,
             })
         }
@@ -226,34 +423,26 @@ mod clip {
     impl Clip<ClipStateBuild> {
         pub(crate) fn embed(&mut self, text: &String) -> Result<Tensor> {
             let model = self.model.as_ref().expect("model not initialized");
+            let tokenizer = self.tokenizer.as_ref().expect("tokenizer not initialized");
+            let uncond_embeddings = self
+                .uncond_embeddings
+                .as_ref()
+                .expect("uncond_embeddings not initialized");
 
-            let uncond_tokens = match &self.uncond_tokens {
-                Some(uncond_tokens) => uncond_tokens.shallow_clone(),
-                None => {
-                    let uncond_tokens = self.tokenize(&"".to_string())?;
-                    self.uncond_tokens = Some(uncond_tokens.shallow_clone());
-                    uncond_tokens
-                }
-            };
-            let uncond_embeddings = model.forward(&uncond_tokens);
-
-            let tokens = self.tokenize(text)?;
+            let tokens = tokenize(text, tokenizer)?.to(self.device);
             let embeddings = model.forward(&tokens);
 
-            let embeddings = Tensor::cat(&[uncond_embeddings, embeddings], 0).to(self.device);
+            let embeddings = Tensor::cat(&[uncond_embeddings, &embeddings], 0).to(self.device);
 
             Ok(embeddings)
         }
+    }
 
-        fn tokenize(&self, text: &String) -> Result<Tensor> {
-            let tokenizer = self.tokenizer.as_ref().expect("tokenizer not initialized");
-
-            let tokens = tokenizer.encode(&text)?;
-            let tokens = tokens.into_iter().map(|x| x as i64).collect::<Vec<i64>>();
-            let tokens = Tensor::from_slice(&tokens).view((1, -1)).to(self.device);
-
-            Ok(tokens)
-        }
+    fn tokenize(text: &String, tokenizer: &Tokenizer) -> Result<Tensor> {
+        let tokens = tokenizer.encode(&text)?;
+        let tokens = tokens.into_iter().map(|x| x as i64).collect::<Vec<i64>>();
+        let tokens = Tensor::from_slice(&tokens).view((1, -1));
+        Ok(tokens)
     }
 }
 
@@ -335,7 +524,7 @@ mod unet {
     use anyhow::{Ok, Result};
 
     use super::backend::{models::unet_2d, schedulers};
-    use tch::{nn, Device, Kind, NoGradGuard, Tensor};
+    use tch::{nn, Device, Kind, Tensor};
 
     pub(crate) trait UnetState {}
 
@@ -363,8 +552,8 @@ mod unet {
         scheduler: Option<schedulers::ddim::DDIMScheduler>,
         embeddings: Option<Tensor>,
         image: Option<Tensor>,
+        timesteps: Option<Vec<usize>>,
         timestep: Option<usize>,
-        no_grad_guard: Option<NoGradGuard>,
         _state: PhantomData<T>,
     }
 
@@ -390,8 +579,8 @@ mod unet {
                 scheduler: None,
                 embeddings: None,
                 image: None,
+                timesteps: None,
                 timestep: None,
-                no_grad_guard: None,
                 _state: PhantomData,
             }
         }
@@ -418,8 +607,8 @@ mod unet {
                 scheduler: Some(scheduler),
                 embeddings: None,
                 image: None,
+                timesteps: None,
                 timestep: None,
-                no_grad_guard: None,
                 _state: PhantomData,
             })
         }
@@ -429,8 +618,6 @@ mod unet {
         pub(crate) fn image(self, embeddings: &Tensor, seed: i64) -> Unet<UnetStateImage> {
             let scheduler = self.scheduler.as_ref().expect("scheduler not initialized");
 
-            let no_grad_guard = tch::no_grad_guard();
-
             tch::manual_seed(seed);
             let mut image = Tensor::randn(
                 &[1, 4, self.height / 8, self.width / 8],
@@ -438,6 +625,8 @@ mod unet {
             );
 
             image *= scheduler.init_noise_sigma();
+
+            let timesteps = scheduler.timesteps().to_vec();
 
             Unet {
                 width: self.width,
@@ -451,8 +640,8 @@ mod unet {
                 scheduler: self.scheduler,
                 embeddings: Some(embeddings.shallow_clone()),
                 image: Some(image),
+                timesteps: Some(timesteps),
                 timestep: Some(0),
-                no_grad_guard: Some(no_grad_guard),
                 _state: PhantomData,
             }
         }
@@ -467,29 +656,34 @@ mod unet {
                 .as_ref()
                 .expect("embeddings not initialized");
             let image = self.image.as_ref().expect("image not initialized");
+            let timesteps = self.timesteps.as_ref().expect("timestep not initialized");
             let timestep = self.timestep.expect("timestep not initialized");
 
-            println!("timestep: {}", timestep);
+            let timestep_mapped = timesteps[timestep];
 
             let image_model_input = Tensor::cat(&[image, image], 0);
 
-            let image_model_input = scheduler.scale_model_input(image_model_input, timestep);
-            let noise_pred = model.forward(&image_model_input, timestep as f64, &embeddings);
+            let image_model_input = scheduler.scale_model_input(image_model_input, timestep_mapped);
+            let noise_pred = model.forward(
+                &image_model_input,
+                timestep_mapped as f64,
+                &embeddings.to(self.device),
+            );
             let noise_pred = noise_pred.chunk(2, 0);
             let (noise_pred_uncond, noise_pred_text) = (&noise_pred[0], &noise_pred[1]);
             const GUIDANCE_SCALE: f64 = 7.5;
             let noise_pred =
                 noise_pred_uncond + (noise_pred_text - noise_pred_uncond) * GUIDANCE_SCALE;
-            let image = scheduler.step(&noise_pred, timestep, &image);
+            let image = scheduler.step(&noise_pred, timestep_mapped, &image);
 
             if timestep >= self.steps - 1 {
                 self.image = Some(image);
-                self.timestep = None;
+                self.timesteps = None;
                 return Some(());
             }
 
-            self.image = Some(image);
             self.timestep = Some(timestep + 1);
+            self.image = Some(image);
             None
         }
 
@@ -506,8 +700,8 @@ mod unet {
                 scheduler: self.scheduler,
                 embeddings: self.embeddings,
                 image: self.image,
+                timesteps: None,
                 timestep: None,
-                no_grad_guard: self.no_grad_guard,
                 _state: PhantomData,
             }
         }
@@ -534,125 +728,10 @@ mod unet {
                 scheduler: self.scheduler,
                 embeddings: None,
                 image: None,
+                timesteps: None,
                 timestep: None,
-                no_grad_guard: None,
                 _state: PhantomData,
             })
         }
     }
-}
-
-fn exec_batch(args: Receiver<Args>, config: Config, status: Sender<Status>) -> Result<()> {
-    let Config {
-        width,
-        height,
-        steps,
-        acceleration_config,
-        version,
-        vocab_file,
-        clip_weights,
-        vae_weights,
-        unet_weights,
-        sliced_attention_size,
-    } = config.clone();
-
-    tch::maybe_init_cuda();
-
-    status.send(Status::System {
-        cuda: tch::Cuda::is_available(),
-        cudnn: tch::Cuda::cudnn_is_available(),
-        mps: tch::utils::has_mps(),
-    })?;
-
-    let sd_config =
-        build_stable_diffusion_config(version, sliced_attention_size, Some(width), Some(height));
-
-    let clip_device = acceleration_config.build_device_for(Workload::Clip);
-    let vae_device = acceleration_config.build_device_for(Workload::Vae);
-    let unet_device = acceleration_config.build_device_for(Workload::Unet);
-
-    let clip = clip::Clip::<clip::ClipStateNew>::new(
-        sd_config.clip.clone(),
-        clip_device,
-        vocab_file,
-        clip_weights,
-    );
-    let vae = vae::Vae::<vae::VaeStateNew>::new(sd_config.vae, vae_device, vae_weights);
-    let unet = unet::Unet::<unet::UnetStateNew>::new(
-        width,
-        height,
-        steps,
-        sd_config.unet.clone(),
-        sd_config.scheduler.clone(),
-        unet_device,
-        unet_weights,
-    );
-
-    status.send(Status::Building(Workload::Clip))?;
-    let mut clip = clip.build()?;
-
-    status.send(Status::Building(Workload::Vae))?;
-    let vae = vae.build()?;
-
-    status.send(Status::Building(Workload::Unet))?;
-    let unet = unet.build()?;
-
-    let mut arg: Option<Args> = None;
-    let mut embeddings: Option<Tensor> = None;
-
-    enum UnetWithState {
-        Build(unet::Unet<unet::UnetStateBuild>),
-        Image(unet::Unet<unet::UnetStateImage>),
-        Done(unet::Unet<unet::UnetStateImageDone>),
-    }
-
-    let mut unet = UnetWithState::Build(unet);
-
-    let mut image: Option<Tensor> = None;
-
-    loop {
-        let Args { prompt, seed, path } = match arg.clone() {
-            Some(arg) => arg,
-            None => match args.recv() {
-                Ok(a) => {
-                    arg = Some(a);
-                    continue;
-                }
-                Err(_) => break,
-            },
-        };
-
-        let embeds = match embeddings {
-            Some(ref e) => e,
-            None => {
-                let e = clip.embed(&prompt)?;
-                embeddings = Some(e);
-                continue;
-            }
-        };
-
-        unet = match unet {
-            UnetWithState::Build(unet) => UnetWithState::Image(unet.image(embeds, seed)),
-            UnetWithState::Image(mut unet) => match unet.step() {
-                Some(()) => UnetWithState::Done(unet.finish()),
-                None => UnetWithState::Image(unet),
-            },
-            UnetWithState::Done(unet) => {
-                arg = None;
-                embeddings = None;
-                image = Some(unet.image());
-                let unet = unet.reset()?;
-                UnetWithState::Build(unet)
-            }
-        };
-
-        if let Some(img) = image {
-            let img = vae.decode(img)?;
-
-            tch::vision::image::save(&img, path)?;
-            image = None;
-        }
-    }
-
-    Ok(())
 }
