@@ -47,7 +47,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::from_version(Version::V2_1)
+        Self::from_version(Version::V1_5)
     }
 }
 
@@ -133,9 +133,12 @@ impl BackendConfigBuilder {
             }
         };
 
-        let scheduler_config = backend::schedulers::ddim::DDIMSchedulerConfig {
-            prediction_type: backend::schedulers::PredictionType::VPrediction,
-            ..Default::default()
+        let scheduler_config = match version {
+            Version::V1_5 => Default::default(),
+            Version::V2_1 => backend::schedulers::ddim::DDIMSchedulerConfig {
+                prediction_type: backend::schedulers::PredictionType::VPrediction,
+                ..Default::default()
+            },
         };
 
         BackendConfigBuilder {
